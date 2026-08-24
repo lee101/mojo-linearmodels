@@ -1,14 +1,11 @@
 """Dense panel-data and IV kernels exposed through one C ABI compilation unit."""
 
-from std.algorithm import sync_parallelize
 from std.math import sqrt
 from std.sys.info import simd_width_of
 
 comptime W = simd_width_of[DType.float64]()
-comptime PARALLEL_DIFFERENCE_THRESHOLD = 65536
-comptime DIFFERENCE_GRAIN = 16384
-comptime Ptr = UnsafePointer[Float64, AnyOrigin[mut=True]]
-comptime IPtr = UnsafePointer[Int64, AnyOrigin[mut=True]]
+comptime Ptr = Pointer[Float64, AnyOrigin[mut=True]]
+comptime IPtr = Pointer[Int64, AnyOrigin[mut=True]]
 
 
 def p(addr: Int) -> Ptr:
@@ -23,11 +20,11 @@ def dot(a: Ptr, b: Ptr, n: Int) -> Float64:
     var acc = SIMD[DType.float64, W](0.0)
     var i = 0
     while i + W <= n:
-        acc += a.load[width=W](i) * b.load[width=W](i)
+        acc += a.unsafe_load[width=W](i) * b.unsafe_load[width=W](i)
         i += W
     var total = acc.reduce_add()
     while i < n:
-        total += a[i] * b[i]
+        total += a[unsafe_offset=i] * b[unsafe_offset=i]
         i += 1
     return total
 
@@ -36,75 +33,77 @@ def axpy(alpha: Float64, x: Ptr, y: Ptr, n: Int):
     var va = SIMD[DType.float64, W](alpha)
     var i = 0
     while i + W <= n:
-        y.store(i, y.load[width=W](i) + va * x.load[width=W](i))
+        y.unsafe_store(
+            i, y.unsafe_load[width=W](i) + va * x.unsafe_load[width=W](i)
+        )
         i += W
     while i < n:
-        y[i] += alpha * x[i]
+        y[unsafe_offset=i] += alpha * x[unsafe_offset=i]
         i += 1
 
 
 def gram(x: Ptr, dst: Ptr, n: Int, d: Int):
     for i in range(d * d):
-        dst[i] = 0.0
+        dst[unsafe_offset=i] = 0.0
     for r in range(n):
-        var row = x + r * d
+        var row = x.unsafe_offset(r * d)
         for i in range(d):
-            var value = row[i]
+            var value = row[unsafe_offset=i]
             if value != 0.0:
-                axpy(value, row, dst + i * d, i + 1)
+                axpy(value, row, dst.unsafe_offset(i * d), i + 1)
     for i in range(d):
         for j in range(i + 1, d):
-            dst[i * d + j] = dst[j * d + i]
+            dst[unsafe_offset=i * d + j] = dst[unsafe_offset=j * d + i]
 
 
 def cross(a: Ptr, b: Ptr, dst: Ptr, n: Int, da: Int, db: Int):
     for i in range(da * db):
-        dst[i] = 0.0
+        dst[unsafe_offset=i] = 0.0
     for r in range(n):
-        var ar = a + r * da
-        var br = b + r * db
+        var ar = a.unsafe_offset(r * da)
+        var br = b.unsafe_offset(r * db)
         for i in range(da):
-            var value = ar[i]
+            var value = ar[unsafe_offset=i]
             if value != 0.0:
-                axpy(value, br, dst + i * db, db)
+                axpy(value, br, dst.unsafe_offset(i * db), db)
 
 
 def cholesky(a: Ptr, d: Int) -> Bool:
     for i in range(d):
         for j in range(i + 1):
-            var acc = a[i * d + j]
+            var acc = a[unsafe_offset=i * d + j]
             for k in range(j):
-                acc -= a[i * d + k] * a[j * d + k]
+                acc -= a[unsafe_offset=i * d + k] * a[unsafe_offset=j * d + k]
             if i == j:
                 if acc <= 0.0:
                     return False
-                a[i * d + i] = sqrt(acc)
+                a[unsafe_offset=i * d + i] = sqrt(acc)
             else:
-                a[i * d + j] = acc / a[j * d + j]
+                a[unsafe_offset=i * d + j] = acc / a[unsafe_offset=j * d + j]
     return True
 
 
 def cholesky_solve(l: Ptr, b: Ptr, d: Int):
     for i in range(d):
-        var acc = b[i]
+        var acc = b[unsafe_offset=i]
         for k in range(i):
-            acc -= l[i * d + k] * b[k]
-        b[i] = acc / l[i * d + i]
+            acc -= l[unsafe_offset=i * d + k] * b[unsafe_offset=k]
+        b[unsafe_offset=i] = acc / l[unsafe_offset=i * d + i]
     for ri in range(d):
         var i = d - 1 - ri
-        var acc = b[i]
+        var acc = b[unsafe_offset=i]
         for k in range(i + 1, d):
-            acc -= l[k * d + i] * b[k]
-        b[i] = acc / l[i * d + i]
+            acc -= l[unsafe_offset=k * d + i] * b[unsafe_offset=k]
+        b[unsafe_offset=i] = acc / l[unsafe_offset=i * d + i]
 
 
 def solve_columns(l: Ptr, b: Ptr, rows: Int, cols: Int, work: Ptr):
     for j in range(cols):
         for i in range(rows):
-            work[i] = b[i * cols + j]
+            work[unsafe_offset=i] = b[unsafe_offset=i * cols + j]
         cholesky_solve(l, work, rows)
         for i in range(rows):
-            b[i * cols + j] = work[i]
+            b[unsafe_offset=i * cols + j] = work[unsafe_offset=i]
 
 
 def ols(x: Ptr, y: Ptr, beta: Ptr, work: Ptr, n: Int, k: Int) -> Bool:
@@ -112,8 +111,8 @@ def ols(x: Ptr, y: Ptr, beta: Ptr, work: Ptr, n: Int, k: Int) -> Bool:
     for j in range(k):
         var acc = 0.0
         for i in range(n):
-            acc += x[i * k + j] * y[i]
-        beta[j] = acc
+            acc += x[unsafe_offset=i * k + j] * y[unsafe_offset=i]
+        beta[unsafe_offset=j] = acc
     if not cholesky(work, k):
         return False
     cholesky_solve(work, beta, k)
@@ -125,24 +124,29 @@ def group_center_once(
     means: Ptr, sums: Ptr
 ) -> Float64:
     for g in range(groups):
-        sums[g] = 0.0
+        sums[unsafe_offset=g] = 0.0
     for i in range(groups * d):
-        means[i] = 0.0
+        means[unsafe_offset=i] = 0.0
     for i in range(n):
-        var g = Int(codes[i])
-        var wi = weights[i]
-        sums[g] += wi
-        axpy(wi, data + i * d, means + g * d, d)
+        var g = Int(codes[unsafe_offset=i])
+        var wi = weights[unsafe_offset=i]
+        sums[unsafe_offset=g] += wi
+        axpy(wi, data.unsafe_offset(i * d), means.unsafe_offset(g * d), d)
     var largest = 0.0
     for g in range(groups):
-        if sums[g] > 0.0:
-            var inv = 1.0 / sums[g]
+        if sums[unsafe_offset=g] > 0.0:
+            var inv = 1.0 / sums[unsafe_offset=g]
             for j in range(d):
-                var value = means[g * d + j] * inv
-                means[g * d + j] = value
+                var value = means[unsafe_offset=g * d + j] * inv
+                means[unsafe_offset=g * d + j] = value
                 largest = max(largest, abs(value))
     for i in range(n):
-        axpy(-1.0, means + Int(codes[i]) * d, data + i * d, d)
+        axpy(
+            -1.0,
+            means.unsafe_offset(Int(codes[unsafe_offset=i]) * d),
+            data.unsafe_offset(i * d),
+            d,
+        )
     return largest
 
 
@@ -155,12 +159,12 @@ def mlm_group_demean(
     var w = p(weights)
     var result = p(dst)
     for i in range(n * d):
-        result[i] = x[i]
+        result[unsafe_offset=i] = x[unsafe_offset=i]
     _ = group_center_once(result, w, ip(codes), n, d, groups, p(means), p(sums))
     for i in range(n):
-        var root_w = sqrt(w[i])
+        var root_w = sqrt(w[unsafe_offset=i])
         for j in range(d):
-            result[i * d + j] *= root_w
+            result[unsafe_offset=i * d + j] *= root_w
 
 
 @export("mlm_two_way_demean")
@@ -173,7 +177,7 @@ def mlm_two_way_demean(
     var w = p(weights)
     var result = p(dst)
     for i in range(n * d):
-        result[i] = x[i]
+        result[unsafe_offset=i] = x[unsafe_offset=i]
     var iterations = 0
     while iterations < max_iter:
         var a = group_center_once(
@@ -186,9 +190,9 @@ def mlm_two_way_demean(
         if max(a, b) < tol:
             break
     for i in range(n):
-        var root_w = sqrt(w[i])
+        var root_w = sqrt(w[unsafe_offset=i])
         for j in range(d):
-            result[i * d + j] *= root_w
+            result[unsafe_offset=i * d + j] *= root_w
     return iterations
 
 
@@ -201,35 +205,38 @@ def mlm_group_mean(
     var w = p(weights)
     var result = p(dst)
     for i in range(groups * d):
-        result[i] = 0.0
+        result[unsafe_offset=i] = 0.0
     for g in range(groups):
-        p(sums)[g] = 0.0
+        p(sums)[unsafe_offset=g] = 0.0
     for i in range(n):
-        var g = Int(ip(codes)[i])
-        var wi = w[i]
-        p(sums)[g] += wi
-        axpy(wi, x + i * d, result + g * d, d)
+        var g = Int(ip(codes)[unsafe_offset=i])
+        var wi = w[unsafe_offset=i]
+        p(sums)[unsafe_offset=g] += wi
+        axpy(wi, x.unsafe_offset(i * d), result.unsafe_offset(g * d), d)
     for g in range(groups):
-        if p(sums)[g] > 0.0:
-            var inv = 1.0 / p(sums)[g]
+        if p(sums)[unsafe_offset=g] > 0.0:
+            var inv = 1.0 / p(sums)[unsafe_offset=g]
             for j in range(d):
-                result[g * d + j] *= inv
+                result[unsafe_offset=g * d + j] *= inv
 
 
 def difference_row(x: Ptr, right: IPtr, result: Ptr, row: Int, d: Int):
-    var source_row = Int(right[row])
-    var current = x + source_row * d
-    var previous = current - d
-    var target = result + row * d
+    var source_row = Int(right[unsafe_offset=row])
+    var current = x.unsafe_offset(source_row * d)
+    var previous = current.unsafe_offset(-d)
+    var target = result.unsafe_offset(row * d)
     var j = 0
     while j + W <= d:
-        target.store(
+        target.unsafe_store(
             j,
-            current.load[width=W](j) - previous.load[width=W](j),
+            current.unsafe_load[width=W](j)
+            - previous.unsafe_load[width=W](j),
         )
         j += W
     while j < d:
-        target[j] = current[j] - previous[j]
+        target[unsafe_offset=j] = (
+            current[unsafe_offset=j] - previous[unsafe_offset=j]
+        )
         j += 1
 
 
@@ -240,33 +247,20 @@ def first_difference_serial(
         difference_row(x, right, result, row, d)
 
 
-def first_difference_parallel(
+def first_difference(
     src: Int, right_addr: Int, dst: Int, rows: Int, d: Int
 ):
-    if rows < PARALLEL_DIFFERENCE_THRESHOLD:
-        first_difference_serial(p(src), ip(right_addr), p(dst), rows, d)
-        return
-
-    var chunks = (rows + DIFFERENCE_GRAIN - 1) // DIFFERENCE_GRAIN
-
-    @parameter
-    def process_chunk(chunk: Int):
-        var x = p(src)
-        var right = ip(right_addr)
-        var result = p(dst)
-        var start = chunk * DIFFERENCE_GRAIN
-        var end = min(start + DIFFERENCE_GRAIN, rows)
-        for row in range(start, end):
-            difference_row(x, right, result, row, d)
-
-    sync_parallelize[process_chunk](chunks)
+    # CPU task scheduling moved from the Mojo standard library into MAX in
+    # Mojo 1.1.  Keep this standalone shared library free of a MAX runtime
+    # dependency; the row kernel remains SIMD-vectorized.
+    first_difference_serial(p(src), ip(right_addr), p(dst), rows, d)
 
 
 @export("mlm_first_difference")
 def mlm_first_difference(
     src: Int, right: Int, dst: Int, rows: Int, d: Int
 ) abi("C"):
-    first_difference_parallel(src, right, dst, rows, d)
+    first_difference(src, right, dst, rows, d)
 
 
 @export("mlm_ols")
@@ -288,7 +282,7 @@ def mlm_predict(
     x: Int, beta: Int, dst: Int, n: Int, k: Int
 ) abi("C"):
     for i in range(n):
-        p(dst)[i] = dot(p(x) + i * k, p(beta), k)
+        p(dst)[unsafe_offset=i] = dot(p(x).unsafe_offset(i * k), p(beta), k)
 
 
 @export("mlm_iv2sls")
@@ -301,11 +295,11 @@ def mlm_iv2sls(
     var zp = p(z)
     var wp = p(work)
     var ztz = wp
-    var ztx = ztz + instruments * instruments
-    var ztx_solved = ztx + instruments * k
-    var zty = ztx_solved + instruments * k
-    var xpzx = zty + instruments
-    var temp = xpzx + k * k
+    var ztx = ztz.unsafe_offset(instruments * instruments)
+    var ztx_solved = ztx.unsafe_offset(instruments * k)
+    var zty = ztx_solved.unsafe_offset(instruments * k)
+    var xpzx = zty.unsafe_offset(instruments)
+    var temp = xpzx.unsafe_offset(k * k)
 
     gram(zp, ztz, n, instruments)
     if not cholesky(ztz, instruments):
@@ -314,10 +308,12 @@ def mlm_iv2sls(
     for j in range(instruments):
         var acc = 0.0
         for i in range(n):
-            acc += zp[i * instruments + j] * yp[i]
-        zty[j] = acc
+            acc += (
+                zp[unsafe_offset=i * instruments + j] * yp[unsafe_offset=i]
+            )
+        zty[unsafe_offset=j] = acc
     for i in range(instruments * k):
-        ztx_solved[i] = ztx[i]
+        ztx_solved[unsafe_offset=i] = ztx[unsafe_offset=i]
     solve_columns(ztz, ztx_solved, instruments, k, temp)
     cholesky_solve(ztz, zty, instruments)
 
@@ -325,14 +321,17 @@ def mlm_iv2sls(
         for j in range(i + 1):
             var acc = 0.0
             for q in range(instruments):
-                acc += ztx[q * k + i] * ztx_solved[q * k + j]
-            xpzx[i * k + j] = acc
-            xpzx[j * k + i] = acc
+                acc += (
+                    ztx[unsafe_offset=q * k + i]
+                    * ztx_solved[unsafe_offset=q * k + j]
+                )
+            xpzx[unsafe_offset=i * k + j] = acc
+            xpzx[unsafe_offset=j * k + i] = acc
     for i in range(k):
         var acc = 0.0
         for q in range(instruments):
-            acc += ztx[q * k + i] * zty[q]
-        p(beta)[i] = acc
+            acc += ztx[unsafe_offset=q * k + i] * zty[unsafe_offset=q]
+        p(beta)[unsafe_offset=i] = acc
     if not cholesky(xpzx, k):
         return 0
     cholesky_solve(xpzx, p(beta), k)
