@@ -16,7 +16,13 @@ from mojo_linearmodels import (
     PooledOLS,
     RandomEffects,
 )
-from mojo_linearmodels._lib import first_difference
+from mojo_linearmodels._lib import (
+    demean,
+    first_difference,
+    group_mean,
+    native_predict,
+    quasi_demean,
+)
 
 
 @pytest.fixture(scope="module")
@@ -187,6 +193,59 @@ def test_first_difference_simd_tail_and_parallel_threshold(rows):
     right = np.arange(1, rows + 1, dtype=np.int64)
     actual = first_difference(values, right)
     assert np.array_equal(actual, values[1:] - values[:-1])
+
+
+@pytest.mark.parametrize("rows", [31, 65_537])
+def test_predict_simd_tail_and_parallel_threshold(rows):
+    rng = np.random.default_rng(rows)
+    values = rng.normal(size=(rows, 7))
+    beta = rng.normal(size=7)
+    assert np.allclose(native_predict(values, beta), values @ beta, rtol=2e-15)
+
+
+@pytest.mark.parametrize("rows", [31, 65_537])
+def test_quasi_demean_simd_tail_and_parallel_threshold(rows):
+    rng = np.random.default_rng(rows + 1)
+    columns, groups = 7, 13
+    values = rng.normal(size=(rows, columns))
+    weights = rng.uniform(0.2, 2.0, size=rows)
+    codes = np.arange(rows, dtype=np.int64) % groups
+    means = rng.normal(size=(groups, columns))
+    theta = rng.uniform(size=groups)
+    expected = (
+        values * np.sqrt(weights)[:, None]
+        - theta[codes, None] * means[codes]
+    )
+    assert np.allclose(
+        quasi_demean(values, weights, codes, means, theta), expected,
+        rtol=2e-15,
+    )
+
+
+@pytest.mark.parametrize("sorted_codes", [True, False])
+def test_group_kernels_parallel_sorted_and_unsorted_fallback(sorted_codes):
+    rng = np.random.default_rng(97 + sorted_codes)
+    rows, columns, groups = 40_001, 7, 17
+    values = rng.normal(size=(rows, columns))
+    weights = rng.uniform(0.2, 2.0, size=rows)
+    if sorted_codes:
+        codes = np.arange(rows, dtype=np.int64) * groups // rows
+    else:
+        codes = np.arange(rows, dtype=np.int64) % groups
+    sums = np.bincount(codes, weights=weights, minlength=groups)
+    expected_means = np.zeros((groups, columns))
+    np.add.at(expected_means, codes, values * weights[:, None])
+    expected_means /= sums[:, None]
+    means, actual_sums = group_mean(values, weights, codes, groups)
+    assert np.allclose(actual_sums, sums, rtol=2e-15)
+    assert np.allclose(means, expected_means, rtol=3e-15)
+    expected_demeaned = (
+        values - expected_means[codes]
+    ) * np.sqrt(weights)[:, None]
+    assert np.allclose(
+        demean(values, weights, codes, groups), expected_demeaned,
+        rtol=3e-15,
+    )
 
 
 def test_random_effects(balanced):

@@ -1,11 +1,13 @@
 """Dense panel-data and IV kernels exposed through one C ABI compilation unit."""
 
+from max.algorithm import parallelize
 from std.math import sqrt
-from std.sys.info import simd_width_of
+from std.sys.info import num_physical_cores, simd_width_of
 
 comptime W = simd_width_of[DType.float64]()
 comptime Ptr = Pointer[Float64, AnyOrigin[mut=True]]
 comptime IPtr = Pointer[Int64, AnyOrigin[mut=True]]
+comptime PARALLEL_ELEMENTS = 262_144
 
 
 def p(addr: Int) -> Ptr:
@@ -40,6 +42,46 @@ def axpy(alpha: Float64, x: Ptr, y: Ptr, n: Int):
     while i < n:
         y[unsafe_offset=i] += alpha * x[unsafe_offset=i]
         i += 1
+
+
+def copy_flat(src: Ptr, dst: Ptr, n: Int):
+    var i = 0
+    while i + W <= n:
+        dst.unsafe_store(i, src.unsafe_load[width=W](i))
+        i += W
+    while i < n:
+        dst[unsafe_offset=i] = src[unsafe_offset=i]
+        i += 1
+
+
+def scale_row(data: Ptr, scale: Float64, d: Int):
+    var value = SIMD[DType.float64, W](scale)
+    var j = 0
+    while j + W <= d:
+        data.unsafe_store(j, data.unsafe_load[width=W](j) * value)
+        j += W
+    while j < d:
+        data[unsafe_offset=j] *= scale
+        j += 1
+
+
+def scale_rows(data: Ptr, weights: Ptr, n: Int, d: Int):
+    var workers = min(max(num_physical_cores(), 1), 8)
+
+    @__parameter
+    def process(worker: Int):
+        var start = worker * n // workers
+        var end = (worker + 1) * n // workers
+        for i in range(start, end):
+            scale_row(
+                data.unsafe_offset(i * d), sqrt(weights[unsafe_offset=i]), d
+            )
+
+    if n * d >= PARALLEL_ELEMENTS and workers > 1:
+        parallelize[process](workers, workers)
+    else:
+        workers = 1
+        process(0)
 
 
 def gram(x: Ptr, dst: Ptr, n: Int, d: Int):
@@ -106,8 +148,11 @@ def solve_columns(l: Ptr, b: Ptr, rows: Int, cols: Int, work: Ptr):
             b[unsafe_offset=i * cols + j] = work[unsafe_offset=i]
 
 
-def ols(x: Ptr, y: Ptr, beta: Ptr, work: Ptr, n: Int, k: Int) -> Bool:
+def ols(
+    x: Ptr, y: Ptr, beta: Ptr, work: Ptr, gram_result: Ptr, n: Int, k: Int
+) -> Bool:
     gram(x, work, n, k)
+    copy_flat(work, gram_result, k * k)
     for j in range(k):
         var acc = 0.0
         for i in range(n):
@@ -150,6 +195,61 @@ def group_center_once(
     return largest
 
 
+def codes_are_sorted(codes: IPtr, n: Int) -> Bool:
+    for i in range(1, n):
+        if codes[unsafe_offset=i] < codes[unsafe_offset=i - 1]:
+            return False
+    return True
+
+
+def grouped_sorted(
+    data: Ptr, weights: Ptr, codes: IPtr, n: Int, d: Int, groups: Int,
+    means: Ptr, sums: Ptr, center: Bool
+):
+    for g in range(groups):
+        sums[unsafe_offset=g] = 0.0
+    for i in range(groups * d):
+        means[unsafe_offset=i] = 0.0
+    var workers = min(max(num_physical_cores(), 1), 8)
+
+    @__parameter
+    def process(worker: Int):
+        var start = worker * n // workers
+        var end = (worker + 1) * n // workers
+        if start > 0:
+            while start < n and codes[unsafe_offset=start] == codes[unsafe_offset=start - 1]:
+                start += 1
+        if end < n:
+            while end < n and codes[unsafe_offset=end] == codes[unsafe_offset=end - 1]:
+                end += 1
+        end = max(end, start)
+        var i = start
+        while i < end:
+            var g = Int(codes[unsafe_offset=i])
+            var group_end = i + 1
+            while group_end < end and codes[unsafe_offset=group_end] == codes[unsafe_offset=i]:
+                group_end += 1
+            for row in range(i, group_end):
+                var wi = weights[unsafe_offset=row]
+                sums[unsafe_offset=g] += wi
+                axpy(
+                    wi, data.unsafe_offset(row * d),
+                    means.unsafe_offset(g * d), d,
+                )
+            scale_row(
+                means.unsafe_offset(g * d), 1.0 / sums[unsafe_offset=g], d
+            )
+            if center:
+                for row in range(i, group_end):
+                    axpy(
+                        -1.0, means.unsafe_offset(g * d),
+                        data.unsafe_offset(row * d), d,
+                    )
+            i = group_end
+
+    parallelize[process](workers, workers)
+
+
 @export("mlm_group_demean")
 def mlm_group_demean(
     src: Int, weights: Int, codes: Int, dst: Int, means: Int, sums: Int,
@@ -158,13 +258,20 @@ def mlm_group_demean(
     var x = p(src)
     var w = p(weights)
     var result = p(dst)
-    for i in range(n * d):
-        result[unsafe_offset=i] = x[unsafe_offset=i]
-    _ = group_center_once(result, w, ip(codes), n, d, groups, p(means), p(sums))
-    for i in range(n):
-        var root_w = sqrt(w[unsafe_offset=i])
-        for j in range(d):
-            result[unsafe_offset=i * d + j] *= root_w
+    copy_flat(x, result, n * d)
+    if (
+        n * d >= PARALLEL_ELEMENTS
+        and groups > 1
+        and codes_are_sorted(ip(codes), n)
+    ):
+        grouped_sorted(
+            result, w, ip(codes), n, d, groups, p(means), p(sums), True
+        )
+    else:
+        _ = group_center_once(
+            result, w, ip(codes), n, d, groups, p(means), p(sums)
+        )
+    scale_rows(result, w, n, d)
 
 
 @export("mlm_two_way_demean")
@@ -176,8 +283,7 @@ def mlm_two_way_demean(
     var x = p(src)
     var w = p(weights)
     var result = p(dst)
-    for i in range(n * d):
-        result[unsafe_offset=i] = x[unsafe_offset=i]
+    copy_flat(x, result, n * d)
     var iterations = 0
     while iterations < max_iter:
         var a = group_center_once(
@@ -189,10 +295,7 @@ def mlm_two_way_demean(
         iterations += 1
         if max(a, b) < tol:
             break
-    for i in range(n):
-        var root_w = sqrt(w[unsafe_offset=i])
-        for j in range(d):
-            result[unsafe_offset=i * d + j] *= root_w
+    scale_rows(result, w, n, d)
     return iterations
 
 
@@ -204,6 +307,15 @@ def mlm_group_mean(
     var x = p(src)
     var w = p(weights)
     var result = p(dst)
+    if (
+        n * d >= PARALLEL_ELEMENTS
+        and groups > 1
+        and codes_are_sorted(ip(codes), n)
+    ):
+        grouped_sorted(
+            x, w, ip(codes), n, d, groups, result, p(sums), False
+        )
+        return
     for i in range(groups * d):
         result[unsafe_offset=i] = 0.0
     for g in range(groups):
@@ -216,8 +328,7 @@ def mlm_group_mean(
     for g in range(groups):
         if p(sums)[unsafe_offset=g] > 0.0:
             var inv = 1.0 / p(sums)[unsafe_offset=g]
-            for j in range(d):
-                result[unsafe_offset=g * d + j] *= inv
+            scale_row(result.unsafe_offset(g * d), inv, d)
 
 
 def difference_row(x: Ptr, right: IPtr, result: Ptr, row: Int, d: Int):
@@ -250,10 +361,23 @@ def first_difference_serial(
 def first_difference(
     src: Int, right_addr: Int, dst: Int, rows: Int, d: Int
 ):
-    # CPU task scheduling moved from the Mojo standard library into MAX in
-    # Mojo 1.1.  Keep this standalone shared library free of a MAX runtime
-    # dependency; the row kernel remains SIMD-vectorized.
-    first_difference_serial(p(src), ip(right_addr), p(dst), rows, d)
+    var x = p(src)
+    var right = ip(right_addr)
+    var result = p(dst)
+    var workers = min(max(num_physical_cores(), 1), 8)
+
+    @__parameter
+    def process(worker: Int):
+        var start = worker * rows // workers
+        var end = (worker + 1) * rows // workers
+        for row in range(start, end):
+            difference_row(x, right, result, row, d)
+
+    if rows * d >= PARALLEL_ELEMENTS and workers > 1:
+        parallelize[process](workers, workers)
+    else:
+        workers = 1
+        process(0)
 
 
 @export("mlm_first_difference")
@@ -265,9 +389,11 @@ def mlm_first_difference(
 
 @export("mlm_ols")
 def mlm_ols(
-    x: Int, y: Int, beta: Int, work: Int, n: Int, k: Int
+    x: Int, y: Int, beta: Int, work: Int, gram_result: Int, n: Int, k: Int
 ) abi("C") -> Int:
-    return 1 if ols(p(x), p(y), p(beta), p(work), n, k) else 0
+    return 1 if ols(
+        p(x), p(y), p(beta), p(work), p(gram_result), n, k
+    ) else 0
 
 
 @export("mlm_cross")
@@ -281,13 +407,74 @@ def mlm_cross(
 def mlm_predict(
     x: Int, beta: Int, dst: Int, n: Int, k: Int
 ) abi("C"):
-    for i in range(n):
-        p(dst)[unsafe_offset=i] = dot(p(x).unsafe_offset(i * k), p(beta), k)
+    var xp = p(x)
+    var bp = p(beta)
+    var result = p(dst)
+    var workers = min(max(num_physical_cores(), 1), 8)
+
+    @__parameter
+    def process(worker: Int):
+        var start = worker * n // workers
+        var end = (worker + 1) * n // workers
+        for i in range(start, end):
+            result[unsafe_offset=i] = dot(xp.unsafe_offset(i * k), bp, k)
+
+    if n * k >= PARALLEL_ELEMENTS and workers > 1:
+        parallelize[process](workers, workers)
+    else:
+        workers = 1
+        process(0)
+
+
+@export("mlm_quasi_demean")
+def mlm_quasi_demean(
+    src: Int, weights: Int, codes: Int, means: Int, theta: Int, dst: Int,
+    n: Int, d: Int
+) abi("C"):
+    var xp = p(src)
+    var wp = p(weights)
+    var cp = ip(codes)
+    var mp = p(means)
+    var tp = p(theta)
+    var result = p(dst)
+    var workers = min(max(num_physical_cores(), 1), 8)
+
+    @__parameter
+    def process(worker: Int):
+        var start = worker * n // workers
+        var end = (worker + 1) * n // workers
+        for i in range(start, end):
+            var g = Int(cp[unsafe_offset=i])
+            var root_w = SIMD[DType.float64, W](sqrt(wp[unsafe_offset=i]))
+            var theta_g = SIMD[DType.float64, W](tp[unsafe_offset=g])
+            var source = xp.unsafe_offset(i * d)
+            var mean = mp.unsafe_offset(g * d)
+            var target = result.unsafe_offset(i * d)
+            var j = 0
+            while j + W <= d:
+                target.unsafe_store(
+                    j,
+                    source.unsafe_load[width=W](j) * root_w
+                    - mean.unsafe_load[width=W](j) * theta_g,
+                )
+                j += W
+            while j < d:
+                target[unsafe_offset=j] = (
+                    source[unsafe_offset=j] * sqrt(wp[unsafe_offset=i])
+                    - mean[unsafe_offset=j] * tp[unsafe_offset=g]
+                )
+                j += 1
+
+    if n * d >= PARALLEL_ELEMENTS and workers > 1:
+        parallelize[process](workers, workers)
+    else:
+        workers = 1
+        process(0)
 
 
 @export("mlm_iv2sls")
 def mlm_iv2sls(
-    x: Int, y: Int, z: Int, beta: Int, work: Int,
+    x: Int, y: Int, z: Int, beta: Int, projection: Int, work: Int,
     n: Int, k: Int, instruments: Int
 ) abi("C") -> Int:
     var xp = p(x)
@@ -315,6 +502,7 @@ def mlm_iv2sls(
     for i in range(instruments * k):
         ztx_solved[unsafe_offset=i] = ztx[unsafe_offset=i]
     solve_columns(ztz, ztx_solved, instruments, k, temp)
+    copy_flat(ztx_solved, p(projection), instruments * k)
     cholesky_solve(ztz, zty, instruments)
 
     for i in range(k):

@@ -21,10 +21,11 @@ _SIGNATURES = {
     "mlm_two_way_demean": ([I] * 11 + [I, F], I),
     "mlm_group_mean": ([I] * 8, None),
     "mlm_first_difference": ([I] * 5, None),
-    "mlm_ols": ([I] * 6, I),
+    "mlm_ols": ([I] * 7, I),
     "mlm_cross": ([I] * 6, None),
     "mlm_predict": ([I] * 5, None),
-    "mlm_iv2sls": ([I] * 8, I),
+    "mlm_quasi_demean": ([I] * 8, None),
+    "mlm_iv2sls": ([I] * 9, I),
 }
 
 _library: ctypes.CDLL | None = None
@@ -127,10 +128,13 @@ def native_ols(x: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     y = _vector(y, "y", length=n)
     beta = np.empty(k)
     work = np.empty((k, k))
-    ok = lib().mlm_ols(addr(x), addr(y), addr(beta), addr(work), n, k)
+    gram = np.empty((k, k))
+    ok = lib().mlm_ols(
+        addr(x), addr(y), addr(beta), addr(work), addr(gram), n, k
+    )
     if not ok:
         beta = np.linalg.lstsq(x, y, rcond=None)[0]
-    return beta, x.T @ x
+    return beta, gram
 
 
 def native_predict(x: np.ndarray, beta: np.ndarray) -> np.ndarray:
@@ -205,9 +209,31 @@ def first_difference(
     return result
 
 
-def native_iv(
-    x: np.ndarray, y: np.ndarray, z: np.ndarray
+def quasi_demean(
+    x: np.ndarray,
+    weights: np.ndarray,
+    codes: np.ndarray,
+    means: np.ndarray,
+    theta: np.ndarray,
 ) -> np.ndarray:
+    x = _matrix(x, "x")
+    weights = _vector(weights, "weights", length=x.shape[0])
+    means = _matrix(means, "means")
+    if means.shape[1] != x.shape[1]:
+        raise ValueError("means must have the same number of columns as x")
+    codes = _codes(codes, "codes", x.shape[0], means.shape[0])
+    theta = _vector(theta, "theta", length=means.shape[0])
+    result = np.empty_like(x)
+    lib().mlm_quasi_demean(
+        addr(x), addr(weights), addr(codes), addr(means), addr(theta),
+        addr(result), x.shape[0], x.shape[1],
+    )
+    return result
+
+
+def native_iv(
+    x: np.ndarray, y: np.ndarray, z: np.ndarray, *, return_projection=False
+):
     x = _matrix(x, "x")
     n, k = x.shape
     y = _vector(y, "y", length=n)
@@ -216,16 +242,19 @@ def native_iv(
         raise ValueError("z must have the same number of rows as x")
     ell = z.shape[1]
     beta = np.empty(k)
+    projection = np.empty((ell, k))
     work_size = ell * ell + 2 * ell * k + ell + k * k + max(ell, k)
     work = np.empty(work_size)
     ok = lib().mlm_iv2sls(
-        addr(x), addr(y), addr(z), addr(beta), addr(work), n, k, ell
+        addr(x), addr(y), addr(z), addr(beta), addr(projection), addr(work),
+        n, k, ell
     )
     if not ok:
         ztx = z.T @ x
+        projection = np.linalg.lstsq(z.T @ z, ztx, rcond=None)[0]
         beta = np.linalg.lstsq(
-            ztx.T @ np.linalg.lstsq(z.T @ z, ztx, rcond=None)[0],
+            ztx.T @ projection,
             ztx.T @ np.linalg.lstsq(z.T @ z, z.T @ y, rcond=None)[0],
             rcond=None,
         )[0]
-    return beta
+    return (beta, projection) if return_projection else beta

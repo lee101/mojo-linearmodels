@@ -10,7 +10,7 @@ def frame(value, prefix: str) -> pd.DataFrame:
     if isinstance(value, pd.Series):
         return value.to_frame()
     if isinstance(value, pd.DataFrame):
-        return value.copy()
+        return value
     arr = np.asarray(value)
     if arr.ndim == 1:
         arr = arr[:, None]
@@ -26,6 +26,30 @@ def panel_data(dependent, exog, weights=None):
         raise ValueError("dependent and exog must have the same number of observations")
     if not y.index.equals(x.index):
         x = x.reindex(y.index)
+    clean_aligned = (
+        weights is None
+        and y.index.equals(x.index)
+        and y.index.is_monotonic_increasing
+        and not y.isna().to_numpy().any()
+        and not x.isna().to_numpy().any()
+    )
+    if clean_aligned:
+        index = y.index
+        if isinstance(index, pd.MultiIndex) and index.nlevels >= 2:
+            entity, _ = pd.factorize(index.get_level_values(0), sort=False)
+            time, _ = pd.factorize(index.get_level_values(1), sort=False)
+        else:
+            entity = np.zeros(len(index), dtype=np.int64)
+            time = np.arange(len(index), dtype=np.int64)
+        return (
+            np.ascontiguousarray(y.iloc[:, 0].to_numpy(dtype=np.float64)),
+            np.ascontiguousarray(x.to_numpy(dtype=np.float64)),
+            np.ones(len(index), dtype=np.float64),
+            np.ascontiguousarray(entity, dtype=np.int64),
+            np.ascontiguousarray(time, dtype=np.int64),
+            index,
+            list(x.columns.astype(str)),
+        )
     if weights is None:
         w = pd.Series(1.0, index=y.index)
     else:

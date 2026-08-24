@@ -11,6 +11,44 @@ from .._results import RegressionResults
 
 
 def _iv_data(dependent, exog, endog, instruments, weights):
+    raw_values = [dependent, exog, endog, instruments]
+    if weights is None and all(
+        value is None or isinstance(value, np.ndarray) for value in raw_values
+    ):
+        arrays = []
+        valid = True
+        for value in raw_values:
+            if value is None:
+                arrays.append(None)
+                continue
+            raw = np.asarray(value)
+            if raw.dtype.kind not in "fiu" or raw.ndim not in (1, 2):
+                valid = False
+                break
+            matrix = raw[:, None] if raw.ndim == 1 else raw
+            arrays.append(matrix)
+        if valid and arrays[0] is not None and arrays[0].shape[1] == 1:
+            n = arrays[0].shape[0]
+            if all(value is None or value.shape[0] == n for value in arrays):
+                dense = [
+                    np.empty((n, 0)) if value is None else value
+                    for value in arrays
+                ]
+                if all(np.isfinite(value).all() for value in dense):
+                    yv, ev, dv, qv = dense
+                    x = np.ascontiguousarray(np.column_stack([ev, dv]), dtype=float)
+                    z = np.ascontiguousarray(np.column_stack([ev, qv]), dtype=float)
+                    names = [f"exog.{i}" for i in range(ev.shape[1])]
+                    names += [f"endog.{i}" for i in range(dv.shape[1])]
+                    return (
+                        np.ascontiguousarray(yv[:, 0], dtype=float),
+                        x,
+                        z,
+                        np.ones(n, dtype=float),
+                        pd.RangeIndex(n),
+                        names,
+                        ev.shape[1],
+                    )
     y = frame(dependent, "dependent")
     index = y.index
     e = frame(exog, "exog").reindex(index) if exog is not None else pd.DataFrame(index=index)
@@ -58,9 +96,15 @@ def _cluster_sum(scores: np.ndarray, groups) -> np.ndarray:
     return sums.T @ sums
 
 
-def _iv_cov(x, y, z, beta, kappa, cov_type, debiased, config):
+def _iv_cov(
+    x, y, z, beta, kappa, cov_type, debiased, config, projection=None
+):
     n, k = x.shape
-    pinvz_x = np.linalg.lstsq(z, x, rcond=None)[0]
+    pinvz_x = (
+        np.linalg.lstsq(z, x, rcond=None)[0]
+        if projection is None
+        else projection
+    )
     projected_x = z @ pinvz_x
     v = (1 - kappa) * (x.T @ x / n) + kappa * (x.T @ projected_x / n)
     bread = np.linalg.inv(v)
@@ -124,6 +168,7 @@ class _IVModel:
         self.endog = endog
         self.instruments = instruments
         self.weights = weights
+        self._has_weights = weights is not None
         self._formula: str | None = None
         self._formula_data = None
         nendog = self._x.shape[1] - self._nexog
@@ -137,6 +182,9 @@ class _IVModel:
             raise ValueError("regressors do not have full column rank")
         if np.linalg.matrix_rank(self._z) < self._z.shape[1]:
             raise ValueError("instruments do not have full column rank")
+        self._constant_columns = np.flatnonzero(
+            np.ptp(self._x, axis=0) < 1e-14
+        )
 
     @classmethod
     def from_formula(cls, formula: str, data, *, weights=None, **kwargs):
@@ -184,12 +232,18 @@ class _IVModel:
         return pd.DataFrame(values, index=index, columns=["predictions"])
 
     def _fit(self, *, cov_type, debiased, kappa, **cov_config):
-        root_w = np.sqrt(self._weights)
-        wx = np.ascontiguousarray(self._x * root_w[:, None])
-        wy = np.ascontiguousarray(self._y * root_w)
-        wz = np.ascontiguousarray(self._z * root_w[:, None])
+        if self._has_weights:
+            root_w = np.sqrt(self._weights)
+            wx = np.ascontiguousarray(self._x * root_w[:, None])
+            wy = np.ascontiguousarray(self._y * root_w)
+            wz = np.ascontiguousarray(self._z * root_w[:, None])
+        else:
+            wx, wy, wz = self._x, self._y, self._z
+        projection = None
         if kappa == 1.0:
-            beta = native_iv(wx, wy, wz)
+            beta, projection = native_iv(
+                wx, wy, wz, return_projection=True
+            )
         else:
             pzx = wz @ np.linalg.lstsq(wz, wx, rcond=None)[0]
             a = (1.0 - kappa) * (wx.T @ wx) + kappa * (wx.T @ pzx)
@@ -197,11 +251,14 @@ class _IVModel:
                 wx.T @ (wz @ np.linalg.lstsq(wz, wy, rcond=None)[0])
             )
             beta = np.linalg.solve(a, rhs)
-        cov = _iv_cov(wx, wy, wz, beta, kappa, cov_type, debiased, cov_config)
+        cov = _iv_cov(
+            wx, wy, wz, beta, kappa, cov_type, debiased, cov_config,
+            projection,
+        )
         fitted = native_predict(self._x, beta)
         residuals = self._y - fitted
         weps = wy - wx @ beta
-        constants = np.flatnonzero(np.ptp(self._x, axis=0) < 1e-14)
+        constants = self._constant_columns
         if len(constants):
             constant = wx[:, constants[0]]
             centered_y = wy - constant * (

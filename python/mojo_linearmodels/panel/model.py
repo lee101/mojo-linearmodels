@@ -4,7 +4,14 @@ import numpy as np
 import pandas as pd
 
 from .._data import formula_matrices, frame, panel_data
-from .._lib import demean, first_difference, group_mean, native_ols, native_predict
+from .._lib import (
+    demean,
+    first_difference,
+    group_mean,
+    native_ols,
+    native_predict,
+    quasi_demean,
+)
 from .._results import RegressionResults
 
 
@@ -100,12 +107,16 @@ class _PanelModel:
         self.dependent = dependent
         self.exog = exog
         self.weights = weights
+        self._has_weights = weights is not None
         self.check_rank = bool(check_rank)
         self._formula: str | None = None
         if self._y.ndim != 1:
             raise ValueError("dependent must contain exactly one variable")
         if self.check_rank and np.linalg.matrix_rank(self._x) < self._x.shape[1]:
             raise ValueError("exog does not have full column rank")
+        self._constant_columns = np.flatnonzero(
+            np.ptp(self._x, axis=0) < 1e-14
+        )
 
     @classmethod
     def from_formula(cls, formula: str, data, *, weights=None, **kwargs):
@@ -164,7 +175,7 @@ class _PanelModel:
             fitted = native_predict(self._x, beta)
         if residuals is None:
             residuals = self._y - fitted
-        constant_columns = np.flatnonzero(np.ptp(self._x, axis=0) < 1e-14)
+        constant_columns = self._constant_columns
         if total_ss_override is not None:
             total_ss = float(total_ss_override)
         elif len(constant_columns) and wx.shape[1] == self._x.shape[1]:
@@ -276,7 +287,7 @@ class PanelOLS(_PanelModel):
             transformed = np.ascontiguousarray(combined * root_w[:, None])
         wy, wx = transformed[:, 0], np.ascontiguousarray(transformed[:, 1:])
 
-        has_constant = np.any(np.ptp(self._x, axis=0) < 1e-14)
+        has_constant = bool(len(self._constant_columns))
         if has_constant and (self.entity_effects or self.time_effects):
             grand = np.average(combined, axis=0, weights=self._weights)
             wy = np.ascontiguousarray(wy + root_w * grand[0])
@@ -288,6 +299,9 @@ class PanelOLS(_PanelModel):
             wx = np.ascontiguousarray(wx[:, nonzero])
             self._x = np.ascontiguousarray(self._x[:, nonzero])
             self._names = [n for n, keep in zip(self._names, nonzero) if keep]
+            self._constant_columns = np.flatnonzero(
+                np.ptp(self._x, axis=0) < 1e-14
+            )
         beta, _ = native_ols(wx, wy)
         effects_df = 0
         drop_first = has_constant
@@ -361,7 +375,7 @@ class FirstDifferenceOLS(_PanelModel):
         super().__init__(
             dependent, exog, weights=weights, check_rank=check_rank
         )
-        if np.any(np.ptp(self._x, axis=0) < 1e-14):
+        if len(self._constant_columns):
             raise ValueError("Constants are not allowed in first difference regressions")
 
     def fit(
@@ -421,7 +435,7 @@ class RandomEffects(_PanelModel):
         combined = np.column_stack([self._y, self._x])
         within = demean(combined, self._weights, self._entity, groups)
         ew_y, ew_x = within[:, 0], np.ascontiguousarray(within[:, 1:])
-        has_constant = np.any(np.ptp(self._x, axis=0) < 1e-14)
+        has_constant = bool(len(self._constant_columns))
         if has_constant:
             root_w = np.sqrt(self._weights)
             grand = np.average(combined, axis=0, weights=self._weights)
@@ -449,14 +463,15 @@ class RandomEffects(_PanelModel):
         theta_g = 1.0 - np.sqrt(
             sigma2_e / (counts * sigma2_u + sigma2_e)
         )
-        theta = theta_g[self._entity]
-        root_w = np.sqrt(self._weights)
-        quasi = combined * root_w[:, None] - theta[:, None] * means[self._entity]
+        quasi = quasi_demean(
+            combined, self._weights, self._entity, means, theta_g
+        )
         wy, wx = quasi[:, 0], np.ascontiguousarray(quasi[:, 1:])
         beta, _ = native_ols(wx, wy)
         fitted = native_predict(self._x, beta)
         residuals = self._y - fitted
         if has_constant:
+            root_w = np.sqrt(self._weights)
             mean_component = root_w * (
                 float(root_w @ wy) / float(root_w @ root_w)
             )

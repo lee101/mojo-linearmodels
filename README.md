@@ -80,17 +80,20 @@ Machine: Intel Xeon E5-2697 v4 at 2.30 GHz, Python 3.13.14.
 
 | case | mojo-linearmodels | linearmodels | result |
 | --- | ---: | ---: | ---: |
-| PooledOLS.fit robust (200k x 9) | 441.3 ms | 1374.3 ms | 3.11x faster |
-| PanelOLS entity FE (160k x 7) | 289.3 ms | 1039.2 ms | 3.59x faster |
-| BetweenOLS.fit (500k x 6) | 619.9 ms | 2243.5 ms | 3.62x faster |
-| FirstDifferenceOLS.fit (240k x 6) | 280.2 ms | 1354.4 ms | 4.83x faster |
-| RandomEffects.fit (160k x 7) | 434.9 ms | 1511.1 ms | 3.47x faster |
-| IV2SLS.fit robust (250k, 7 regressors) | 713.9 ms | 1924.2 ms | 2.70x faster |
+| PooledOLS.fit robust (200k x 9) | 271.8 ms | 1620.5 ms | 5.96x faster |
+| PanelOLS entity FE (160k x 7) | 402.2 ms | 1283.3 ms | 3.19x faster |
+| BetweenOLS.fit (500k x 6) | 465.3 ms | 3086.0 ms | 6.63x faster |
+| FirstDifferenceOLS.fit (240k x 6) | 296.1 ms | 1683.0 ms | 5.68x faster |
+| RandomEffects.fit (160k x 7) | 590.2 ms | 1503.7 ms | 2.55x faster |
+| IV2SLS.fit robust (250k, 7 regressors) | 298.6 ms | 2308.8 ms | 7.73x faster |
 
 These results describe this machine and workload, not a universal speedup.
 Upstream can win on different matrix shapes or BLAS/thread configurations.
 
-No GPU path is included.
+No GPU path is included. The profiled work is dominated by short-width group
+transforms, differences, predictions, and small-matrix cross-products with
+less than roughly two floating-point operations per byte moved. These kernels
+are bandwidth-bound and do not justify host/device transfer overhead.
 
 ## How it works
 
@@ -103,9 +106,11 @@ the boundary as integer addresses and are reconstructed as
 Arrays are C-contiguous `float64` in row-major order; category and panel codes
 are contiguous `int64`. Mojo performs SIMD rank-one Gram updates, cross
 products, Cholesky solves, weighted one- and two-way absorption, group means,
-first differences, 2SLS projections, and prediction. Python handles pandas
-index alignment, formulas, covariance assembly, and result objects. Mojo does
-not allocate: every lifetime remains owned by NumPy.
+first differences, 2SLS projections, and prediction. Large independent row
+and sorted-group transforms use thresholded CPU parallelism. Python handles
+pandas index alignment, formulas, covariance assembly, and result objects.
+Mojo does not allocate array buffers: every buffer lifetime remains owned by
+NumPy.
 
 ## License
 
