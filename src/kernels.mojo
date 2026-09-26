@@ -1,13 +1,12 @@
 """Dense panel-data and IV kernels exposed through one C ABI compilation unit."""
 
-from max.algorithm import parallelize
 from std.math import sqrt
-from std.sys.info import num_physical_cores, simd_width_of
+from std.sys.info import simd_width_of
 
 comptime W = simd_width_of[DType.float64]()
 comptime Ptr = Pointer[Float64, AnyOrigin[mut=True]]
 comptime IPtr = Pointer[Int64, AnyOrigin[mut=True]]
-comptime PARALLEL_ELEMENTS = 262_144
+comptime SORTED_GROUP_ELEMENTS = 262_144
 
 
 def p(addr: Int) -> Ptr:
@@ -66,22 +65,10 @@ def scale_row(data: Ptr, scale: Float64, d: Int):
 
 
 def scale_rows(data: Ptr, weights: Ptr, n: Int, d: Int):
-    var workers = min(max(num_physical_cores(), 1), 8)
-
-    @__parameter
-    def process(worker: Int):
-        var start = worker * n // workers
-        var end = (worker + 1) * n // workers
-        for i in range(start, end):
-            scale_row(
-                data.unsafe_offset(i * d), sqrt(weights[unsafe_offset=i]), d
-            )
-
-    if n * d >= PARALLEL_ELEMENTS and workers > 1:
-        parallelize[process](workers, workers)
-    else:
-        workers = 1
-        process(0)
+    for i in range(n):
+        scale_row(
+            data.unsafe_offset(i * d), sqrt(weights[unsafe_offset=i]), d
+        )
 
 
 def gram(x: Ptr, dst: Ptr, n: Int, d: Int):
@@ -210,44 +197,36 @@ def grouped_sorted(
         sums[unsafe_offset=g] = 0.0
     for i in range(groups * d):
         means[unsafe_offset=i] = 0.0
-    var workers = min(max(num_physical_cores(), 1), 8)
 
-    @__parameter
-    def process(worker: Int):
-        var start = worker * n // workers
-        var end = (worker + 1) * n // workers
-        if start > 0:
-            while start < n and codes[unsafe_offset=start] == codes[unsafe_offset=start - 1]:
-                start += 1
-        if end < n:
-            while end < n and codes[unsafe_offset=end] == codes[unsafe_offset=end - 1]:
-                end += 1
-        end = max(end, start)
-        var i = start
-        while i < end:
-            var g = Int(codes[unsafe_offset=i])
-            var group_end = i + 1
-            while group_end < end and codes[unsafe_offset=group_end] == codes[unsafe_offset=i]:
-                group_end += 1
-            for row in range(i, group_end):
-                var wi = weights[unsafe_offset=row]
-                sums[unsafe_offset=g] += wi
-                axpy(
-                    wi, data.unsafe_offset(row * d),
-                    means.unsafe_offset(g * d), d,
-                )
-            scale_row(
-                means.unsafe_offset(g * d), 1.0 / sums[unsafe_offset=g], d
+    # Codes are sorted, so whole groups are contiguous: walking them in index
+    # order visits every row exactly once and keeps each group's accumulation
+    # order identical to the per-group partitioning used before.
+    var i = 0
+    while i < n:
+        var g = Int(codes[unsafe_offset=i])
+        var group_end = i + 1
+        while (
+            group_end < n
+            and codes[unsafe_offset=group_end] == codes[unsafe_offset=i]
+        ):
+            group_end += 1
+        for row in range(i, group_end):
+            var wi = weights[unsafe_offset=row]
+            sums[unsafe_offset=g] += wi
+            axpy(
+                wi, data.unsafe_offset(row * d),
+                means.unsafe_offset(g * d), d,
             )
-            if center:
-                for row in range(i, group_end):
-                    axpy(
-                        -1.0, means.unsafe_offset(g * d),
-                        data.unsafe_offset(row * d), d,
-                    )
-            i = group_end
-
-    parallelize[process](workers, workers)
+        scale_row(
+            means.unsafe_offset(g * d), 1.0 / sums[unsafe_offset=g], d
+        )
+        if center:
+            for row in range(i, group_end):
+                axpy(
+                    -1.0, means.unsafe_offset(g * d),
+                    data.unsafe_offset(row * d), d,
+                )
+        i = group_end
 
 
 @export("mlm_group_demean")
@@ -260,7 +239,7 @@ def mlm_group_demean(
     var result = p(dst)
     copy_flat(x, result, n * d)
     if (
-        n * d >= PARALLEL_ELEMENTS
+        n * d >= SORTED_GROUP_ELEMENTS
         and groups > 1
         and codes_are_sorted(ip(codes), n)
     ):
@@ -308,7 +287,7 @@ def mlm_group_mean(
     var w = p(weights)
     var result = p(dst)
     if (
-        n * d >= PARALLEL_ELEMENTS
+        n * d >= SORTED_GROUP_ELEMENTS
         and groups > 1
         and codes_are_sorted(ip(codes), n)
     ):
@@ -351,33 +330,14 @@ def difference_row(x: Ptr, right: IPtr, result: Ptr, row: Int, d: Int):
         j += 1
 
 
-def first_difference_serial(
-    x: Ptr, right: IPtr, result: Ptr, rows: Int, d: Int
-):
-    for row in range(rows):
-        difference_row(x, right, result, row, d)
-
-
 def first_difference(
     src: Int, right_addr: Int, dst: Int, rows: Int, d: Int
 ):
     var x = p(src)
     var right = ip(right_addr)
     var result = p(dst)
-    var workers = min(max(num_physical_cores(), 1), 8)
-
-    @__parameter
-    def process(worker: Int):
-        var start = worker * rows // workers
-        var end = (worker + 1) * rows // workers
-        for row in range(start, end):
-            difference_row(x, right, result, row, d)
-
-    if rows * d >= PARALLEL_ELEMENTS and workers > 1:
-        parallelize[process](workers, workers)
-    else:
-        workers = 1
-        process(0)
+    for row in range(rows):
+        difference_row(x, right, result, row, d)
 
 
 @export("mlm_first_difference")
@@ -410,20 +370,8 @@ def mlm_predict(
     var xp = p(x)
     var bp = p(beta)
     var result = p(dst)
-    var workers = min(max(num_physical_cores(), 1), 8)
-
-    @__parameter
-    def process(worker: Int):
-        var start = worker * n // workers
-        var end = (worker + 1) * n // workers
-        for i in range(start, end):
-            result[unsafe_offset=i] = dot(xp.unsafe_offset(i * k), bp, k)
-
-    if n * k >= PARALLEL_ELEMENTS and workers > 1:
-        parallelize[process](workers, workers)
-    else:
-        workers = 1
-        process(0)
+    for i in range(n):
+        result[unsafe_offset=i] = dot(xp.unsafe_offset(i * k), bp, k)
 
 
 @export("mlm_quasi_demean")
@@ -437,39 +385,27 @@ def mlm_quasi_demean(
     var mp = p(means)
     var tp = p(theta)
     var result = p(dst)
-    var workers = min(max(num_physical_cores(), 1), 8)
-
-    @__parameter
-    def process(worker: Int):
-        var start = worker * n // workers
-        var end = (worker + 1) * n // workers
-        for i in range(start, end):
-            var g = Int(cp[unsafe_offset=i])
-            var root_w = SIMD[DType.float64, W](sqrt(wp[unsafe_offset=i]))
-            var theta_g = SIMD[DType.float64, W](tp[unsafe_offset=g])
-            var source = xp.unsafe_offset(i * d)
-            var mean = mp.unsafe_offset(g * d)
-            var target = result.unsafe_offset(i * d)
-            var j = 0
-            while j + W <= d:
-                target.unsafe_store(
-                    j,
-                    source.unsafe_load[width=W](j) * root_w
-                    - mean.unsafe_load[width=W](j) * theta_g,
-                )
-                j += W
-            while j < d:
-                target[unsafe_offset=j] = (
-                    source[unsafe_offset=j] * sqrt(wp[unsafe_offset=i])
-                    - mean[unsafe_offset=j] * tp[unsafe_offset=g]
-                )
-                j += 1
-
-    if n * d >= PARALLEL_ELEMENTS and workers > 1:
-        parallelize[process](workers, workers)
-    else:
-        workers = 1
-        process(0)
+    for i in range(n):
+        var g = Int(cp[unsafe_offset=i])
+        var root_w = SIMD[DType.float64, W](sqrt(wp[unsafe_offset=i]))
+        var theta_g = SIMD[DType.float64, W](tp[unsafe_offset=g])
+        var source = xp.unsafe_offset(i * d)
+        var mean = mp.unsafe_offset(g * d)
+        var target = result.unsafe_offset(i * d)
+        var j = 0
+        while j + W <= d:
+            target.unsafe_store(
+                j,
+                source.unsafe_load[width=W](j) * root_w
+                - mean.unsafe_load[width=W](j) * theta_g,
+            )
+            j += W
+        while j < d:
+            target[unsafe_offset=j] = (
+                source[unsafe_offset=j] * sqrt(wp[unsafe_offset=i])
+                - mean[unsafe_offset=j] * tp[unsafe_offset=g]
+            )
+            j += 1
 
 
 @export("mlm_iv2sls")
